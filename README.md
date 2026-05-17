@@ -1,3 +1,9 @@
+> Spark Compete hunt proof for team JUMPERZ.
+>
+> This repository is a standalone `jumperz11` hunt workspace. It is not an upstream submission repo and does not push changes into `vibeforge1111/vibeship-spark-intelligence`.
+>
+> Proof packet: [HUNT_PROOF.md](HUNT_PROOF.md)
+
 <p align="center">
   <a href="https://spark.vibeship.co"><img src="header.png" alt="Spark Intelligence" width="100%"></a>
 </p>
