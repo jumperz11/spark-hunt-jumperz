@@ -29,6 +29,7 @@ Usage:
 import sys
 import json
 import argparse
+import subprocess
 import time
 import os
 from pathlib import Path
@@ -131,6 +132,213 @@ def _configure_output():
                 stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+def _safe_call(fn, default=None):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _run_git(args, cwd: Path):
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        timeout=2,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _redact_git_remote(remote_url: str | None) -> str | None:
+    if not remote_url:
+        return None
+
+    remote_url = remote_url.strip()
+    if not remote_url:
+        return None
+
+    suffix = ".git"
+    if remote_url.endswith(suffix):
+        remote_url = remote_url[: -len(suffix)]
+
+    if "://" in remote_url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(remote_url)
+        host = parsed.hostname or parsed.netloc.split("@")[-1]
+        path = parsed.path.lstrip("/")
+        if host and path:
+            return f"{host}/{path}"
+        return host or None
+
+    if "@" in remote_url and ":" in remote_url:
+        host, path = remote_url.split(":", 1)
+        host = host.split("@", 1)[1]
+        return f"{host}/{path.lstrip('/')}"
+
+    if remote_url.startswith(("/", "~", "file:")):
+        return "local"
+
+    return remote_url
+
+
+def _repo_board_snapshot(project_root: Path) -> dict:
+    inside = _run_git(["rev-parse", "--is-inside-work-tree"], project_root)
+    if inside != "true":
+        return {
+            "git": False,
+            "root_name": project_root.name,
+            "dirty_count": 0,
+            "untracked_count": 0,
+            "remote": None,
+        }
+
+    branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], project_root)
+    upstream = _run_git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], project_root)
+    status = _run_git(["status", "--porcelain=v1"], project_root) or ""
+    rows = [line for line in status.splitlines() if line.strip()]
+    untracked_count = sum(1 for line in rows if line.startswith("??"))
+    remote = _redact_git_remote(_run_git(["config", "--get", "remote.origin.url"], project_root))
+
+    return {
+        "git": True,
+        "root_name": project_root.name,
+        "branch": branch,
+        "upstream": upstream,
+        "remote": remote,
+        "dirty_count": len(rows) - untracked_count,
+        "untracked_count": untracked_count,
+    }
+
+
+def _build_os_compile_snapshot(project_root: Path) -> dict:
+    cognitive_stats = _safe_call(lambda: get_cognitive_learner().get_stats(), {})
+    queue_stats = _safe_call(get_queue_stats, {})
+    profile = _safe_call(lambda: load_profile(project_root), {})
+    score = _safe_call(lambda: completion_score(profile), {})
+    validation_state = _safe_call(get_validation_state, {})
+    prediction_state = _safe_call(get_prediction_state, {})
+    bank_stats = _safe_call(get_bank_stats, {})
+
+    repo_board = _repo_board_snapshot(project_root)
+    gaps = []
+    if not repo_board.get("git"):
+        gaps.append("project_root_not_git_repo")
+    if repo_board.get("dirty_count") or repo_board.get("untracked_count"):
+        gaps.append("repo_has_local_changes")
+    if not _premium_tools_enabled():
+        gaps.append("premium_tools_disabled")
+
+    return {
+        "schema": "spark.os.compile.v1",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "capability": {
+            "cli": "spark",
+            "commands": [
+                "status",
+                "services",
+                "up",
+                "ensure",
+                "down",
+                "sync",
+                "queue",
+                "process",
+                "validate",
+                "learnings",
+                "promote",
+                "write",
+                "sync-context",
+                "decay",
+                "health",
+                "events",
+                "opportunities",
+                "advisory",
+                "outcome",
+                "advice-feedback",
+                "eval",
+                "capture",
+                "memory",
+                "project",
+                "chips",
+                "os",
+            ],
+            "premium_tools_enabled": _premium_tools_enabled(),
+        },
+        "authority": {
+            "surface": "public_track",
+            "output_boundary": "aggregates_only",
+            "redactions": [
+                "raw_secret_values",
+                "raw_logs",
+                "raw_conversations",
+                "raw_memory_rows",
+                "absolute_local_paths",
+            ],
+        },
+        "trace": {
+            "queue": {
+                "event_count": queue_stats.get("event_count"),
+                "size_mb": queue_stats.get("size_mb"),
+                "needs_rotation": queue_stats.get("needs_rotation"),
+                "pattern_backlog": _safe_call(get_pattern_backlog, 0),
+            },
+            "validation": {
+                "backlog": _safe_call(get_validation_backlog, 0),
+                "last_run_present": bool(validation_state.get("last_run_ts")),
+            },
+            "prediction": {
+                "last_run_present": bool(prediction_state.get("last_run_ts")),
+            },
+            "bridge_worker": {
+                "heartbeat_age_s": _safe_call(bridge_heartbeat_age_s),
+            },
+        },
+        "memory": {
+            "cognitive": {
+                "total_insights": cognitive_stats.get("total_insights"),
+                "avg_reliability": cognitive_stats.get("avg_reliability"),
+                "promoted_count": cognitive_stats.get("promoted_count"),
+                "by_category": cognitive_stats.get("by_category", {}),
+            },
+            "banks": bank_stats,
+        },
+        "project": {
+            "domain": profile.get("domain"),
+            "phase": profile.get("phase"),
+            "completion_score": score.get("score"),
+            "done": bool(profile.get("done")),
+        },
+        "repo_board": repo_board,
+        "gaps": gaps,
+    }
+
+
+def cmd_os(args):
+    """Compile safe Spark OS discovery surfaces for agents."""
+    if args.os_cmd != "compile":
+        print("Run `spark os compile --json` to emit a redacted discovery snapshot.")
+        return
+
+    project_root = Path(args.project).expanduser().resolve() if args.project else Path.cwd()
+    payload = _build_os_compile_snapshot(project_root)
+
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    print("Spark OS compile")
+    print(f"  repo: {payload['repo_board'].get('root_name')}")
+    print(f"  branch: {payload['repo_board'].get('branch') or 'n/a'}")
+    print(f"  events: {payload['trace']['queue'].get('event_count')}")
+    print(f"  insights: {payload['memory']['cognitive'].get('total_insights')}")
+    if payload["gaps"]:
+        print(f"  gaps: {', '.join(payload['gaps'])}")
 
 
 def cmd_status(args):
@@ -2562,6 +2770,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
+  os          Compile safe agent discovery snapshots
   status      Show overall system status
   services    Show daemon/service status
   up          Start background services
@@ -2579,6 +2788,7 @@ Commands:
   capture     Memory capture suggestions (portable)
 
 Examples:
+  spark os compile --json
   spark status
   spark services
   spark up --sync-context
@@ -2608,6 +2818,13 @@ Examples:
         p.add_argument("--no-pulse", action="store_true", help="do not start spark pulse")
         p.add_argument("--sync-context", action="store_true", help="run sync-context after start")
         p.add_argument("--project", "-p", default=None, help="project root for sync-context")
+
+    # os
+    os_parser = subparsers.add_parser("os", help="Compile safe agent discovery snapshots")
+    os_sub = os_parser.add_subparsers(dest="os_cmd")
+    os_compile = os_sub.add_parser("compile", help="Compile capability, trace, memory, and repo-board views")
+    os_compile.add_argument("--json", action="store_true", help="Emit JSON output")
+    os_compile.add_argument("--project", "-p", default=None, help="Project root for repo-board view")
 
     # status
     subparsers.add_parser("status", help="Show overall system status")
@@ -3045,6 +3262,7 @@ Examples:
     
     commands = {
         "status": cmd_status,
+        "os": cmd_os,
         "services": cmd_services,
         "up": cmd_up,
         "ensure": cmd_ensure,
